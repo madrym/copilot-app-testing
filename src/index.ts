@@ -263,6 +263,141 @@ const mockIssuesData = {
   ],
 };
 
+// Add new interface for CodeQL alert types
+interface CodeQLAlert {
+  number: number;
+  state: "open" | "fixed" | "dismissed";
+  title: string;  // From security_severity_level
+  severity: string;  // From security_severity_level
+  description: string;  // From message
+  most_recent_instance?: {
+    location?: {
+      path?: string;
+      start_line?: number;
+      end_line?: number;
+      start_column?: number;
+      end_column?: number;
+      snippet?: string;  // Make snippet optional
+    };
+  };
+  // Add missing fields from API
+  created_at: string;
+  updated_at?: string;
+  url: string;
+  html_url: string;
+  instances_url: string;
+  fixed_at?: string | null;
+}
+
+// Add new function to format CodeQL alerts
+function formatCodeQLAlerts(alerts: CodeQLAlert[]) {
+  const severityOrder = ['critical', 'high', 'medium', 'low'];
+  const groupedAlerts = alerts.reduce((acc: { [key: string]: CodeQLAlert[] }, alert) => {
+    acc[alert.severity] = acc[alert.severity] || [];
+    acc[alert.severity].push(alert);
+    return acc;
+  }, {});
+
+  let response = `# Security Vulnerabilities Summary\n\n`;
+  
+  // Add summary section
+  let totalVulns = 0;
+  const summaryItems = severityOrder.map(severity => {
+    const count = groupedAlerts[severity]?.length || 0;
+    totalVulns += count;
+    return count > 0 ? `**${count}** ${severity}` : null;
+  }).filter(Boolean);
+  
+  response += `Found ${totalVulns} total vulnerabilities: ${summaryItems.join(', ')}\n\n`;
+
+  // Create table for high and critical vulnerabilities
+  if (totalVulns > 0) {
+    response += `| Severity | Title | Location | Fix Command (Copy into the chat) |\n`;
+    response += `|:--------:|:-------:|:---------:|:------------|\n`;
+    
+    ['critical', 'high'].forEach(severity => {
+      const severityAlerts = groupedAlerts[severity] || [];
+      severityAlerts.slice(0, 3).forEach(alert => {
+        const location = alert.most_recent_instance?.location;
+        const locationStr = location ? `${location.path}:${location.start_line}` : 'N/A';
+        const uniqueId = `${alert.title} in ${locationStr}`;
+        
+        response += `| **${severity[0].toUpperCase()}** | ${alert.title} | ${locationStr} | \`fix the vulnerability "${uniqueId}"\` |\n`;
+      });
+    });
+  }
+
+  // Add note about medium/low severity issues
+  const mediumCount = groupedAlerts['medium']?.length || 0;
+  const lowCount = groupedAlerts['low']?.length || 0;
+  if (mediumCount || lowCount) {
+    response += `\n---\n`;
+    response += `ℹ️ There are also `;
+    if (mediumCount) response += `**${mediumCount}** medium `;
+    if (mediumCount && lowCount) response += `and `;
+    if (lowCount) response += `**${lowCount}** low `;
+    response += `severity issues. Use \`expand medium\` or \`expand low\` to view them.\n`;
+  }
+
+  return response;
+}
+
+// Add new function to generate fix suggestions
+async function generateCodeQLFix(alert: CodeQLAlert, token: string) {
+  const location = alert.most_recent_instance?.location;
+  
+  let codeContext = '';
+  if (location?.path) {
+    try {
+      // Read the actual file content
+      const filePath = path.join(process.cwd(), location.path);
+      const fileContent = fs.readFileSync(filePath, 'utf8');
+      
+      // Get a few lines before and after the vulnerability
+      const lines = fileContent.split('\n');
+      const startLine = Math.max(0, (location.start_line || 1) - 5);
+      const endLine = Math.min(lines.length, (location.end_line || location.start_line || 1) + 5);
+      
+      codeContext = lines.slice(startLine, endLine).join('\n');
+    } catch (error) {
+      console.error("Error reading file:", error);
+      codeContext = location.snippet || 'File content not available';
+    }
+  }
+
+  const fixPrompt = `You are a security expert. Please analyze this security vulnerability and provide a detailed fix.
+    
+Context:
+- File: ${location?.path}
+- Lines: ${location?.start_line}-${location?.end_line}
+- Title: ${alert.title}
+- Severity: ${alert.severity}
+- Description: ${alert.description}
+
+Relevant code context:
+\`\`\`
+${codeContext}
+\`\`\`
+
+Please provide:
+1. A clear explanation of why this code is vulnerable
+2. A specific code fix with before/after comparison
+3. Additional security best practices to prevent similar issues
+4. Any testing recommendations to verify the fix
+
+Focus on the specific lines of code shown and provide concrete, actionable fixes.`;
+
+  try {
+    const { message } = await prompt(fixPrompt, {
+      model: "gpt-4",
+      token,
+    });
+    return message.content;
+  } catch (error) {
+    console.error("Error generating fix:", error);
+    return "An error occurred while generating the fix suggestion.";
+  }
+}
 
 const app = new Hono();
 
@@ -318,7 +453,7 @@ app.post("/", async (c) => {
     try {
       const { message } = await prompt(userPrompt, {
         model: "gpt-4",
-        token: token,
+        token,
       });
 
       return message.content;
@@ -454,21 +589,12 @@ app.post("/", async (c) => {
 
   // Add new function to get remediation steps
   async function getRemediationSteps(issues: any, token: string) {
-    const remediationPrompt = `Please provide step-by-step remediation instructions for the following vulnerabilities:
-    
-${issues.data.attributes.title} (${issues.data.attributes.effective_severity_level}):
-${issues.data.attributes.description} ${issues.data.attributes.resolution.details}
-
-${issues.included[0].attributes.title} (${issues.included[0].attributes.effective_severity_level}):
-${issues.included[0].attributes.description} ${issues.included[0].attributes.resolution.details}
-
-Please format the response with clear steps and include the suggested package upgrades.`;
+    const remediationPrompt = `Please provide step-by-step remediation instructions for the following vulnerabilities...`;
 
     try {
       const { message } = await prompt(remediationPrompt, {
         model: "gpt-4",
-        token: token,
-        
+        token,
       });
       return message.content;
     } catch (error) {
@@ -498,6 +624,192 @@ Please format the response with clear steps and include the suggested package up
       createTextEvent(remediationSteps) +
       createDoneEvent()
     );
+  }
+
+  // Check if the prompt is asking for CodeQL alerts
+  if (userPrompt.toLowerCase().includes("list codeql")) {
+    const { owner, repo } = await getRepoInfoFromGitConfig();
+    
+    try {
+      const { data: alerts } = await octokit.request('GET /repos/{owner}/{repo}/code-scanning/alerts', {
+        owner,
+        repo,
+        headers: {
+          'X-GitHub-Api-Version': '2022-11-28'
+        }
+      });
+
+      const mappedAlerts: CodeQLAlert[] = alerts.map(alert => ({
+        ...alert,
+        title: alert.rule?.description || 'Unknown',
+        severity: alert.rule?.security_severity_level || 'unknown',
+        description: typeof alert.most_recent_instance?.message === 'string' 
+          ? alert.most_recent_instance.message 
+          : alert.most_recent_instance?.message?.text || 'No description available'
+      }));
+
+      const response = formatCodeQLAlerts(mappedAlerts);
+      
+      return c.text(
+        createAckEvent() +
+        createTextEvent(response) +
+        createDoneEvent()
+      );
+    } catch (error) {
+      return c.text(
+        createErrorsEvent([
+          {
+            type: "agent",
+            message: "Error fetching CodeQL alerts: " + (error instanceof Error ? error.message : String(error)),
+            code: "GITHUB_API_ERROR",
+            identifier: "github_api_error",
+          },
+        ])
+      );
+    }
+  }
+
+  // Check if the prompt is asking for CodeQL fix suggestions
+  if (userPrompt.toLowerCase().includes("fix codeql") || userPrompt.toLowerCase().includes("fix the vulnerability")) {
+    const { owner, repo } = await getRepoInfoFromGitConfig();
+    
+    try {
+      const { data: alerts } = await octokit.request('GET /repos/{owner}/{repo}/code-scanning/alerts', {
+        owner,
+        repo,
+        headers: {
+          'X-GitHub-Api-Version': '2022-11-28'
+        }
+      });
+
+      const mappedAlerts: CodeQLAlert[] = alerts.map(alert => ({
+        ...alert,
+        title: alert.rule?.description || 'Unknown',
+        severity: alert.rule?.security_severity_level || 'unknown',
+        description: typeof alert.most_recent_instance?.message === 'string' 
+          ? alert.most_recent_instance.message 
+          : alert.most_recent_instance?.message?.text || 'No description available'
+      }));
+
+      let targetAlert: CodeQLAlert | undefined;
+      
+      if (userPrompt.toLowerCase().includes("fix the vulnerability")) {
+        const vulnIdentifier = userPrompt.match(/"([^"]+)"/)?.[1] || "";
+        targetAlert = mappedAlerts.find(alert => {
+          const location = alert.most_recent_instance?.location;
+          if (!location) return false;
+          
+          const locationStr = `${location.path}:${location.start_line}`;
+          return vulnIdentifier.includes(locationStr);
+        });
+      } else {
+        // If just "fix codeql", take the most severe open alert
+        targetAlert = mappedAlerts.find(alert => 
+          alert.state === "open" && 
+          (alert.severity === "critical" || alert.severity === "high")
+        );
+      }
+
+      if (!targetAlert) {
+        return c.text(
+          createErrorsEvent([
+            {
+              type: "agent",
+              message: "No matching vulnerability found.",
+              code: "VULN_NOT_FOUND",
+              identifier: "vuln_not_found",
+            },
+          ])
+        );
+      }
+
+      const fixSuggestion = await generateCodeQLFix(targetAlert, tokenForUser);
+      
+      return c.text(
+        createAckEvent() +
+        createTextEvent(fixSuggestion) +
+        createDoneEvent()
+      );
+    } catch (error) {
+      return c.text(
+        createErrorsEvent([
+          {
+            type: "agent",
+            message: "Error processing CodeQL fix: " + (error instanceof Error ? error.message : String(error)),
+            code: "GITHUB_API_ERROR",
+            identifier: "github_api_error",
+          },
+        ])
+      );
+    }
+  }
+
+  // Add new condition for expand command
+  if (userPrompt.toLowerCase().startsWith("expand")) {
+    const { owner, repo } = await getRepoInfoFromGitConfig();
+    const severityLevel = userPrompt.toLowerCase().split(" ")[1];
+    
+    try {
+      const { data: alerts } = await octokit.request('GET /repos/{owner}/{repo}/code-scanning/alerts', {
+        owner,
+        repo,
+        headers: {
+          'X-GitHub-Api-Version': '2022-11-28'
+        }
+      });
+
+      const mappedAlerts: CodeQLAlert[] = alerts.map(alert => ({
+        ...alert,
+        title: alert.rule?.description || 'Unknown',
+        severity: alert.rule?.security_severity_level || 'unknown',
+        description: typeof alert.most_recent_instance?.message === 'string' 
+          ? alert.most_recent_instance.message 
+          : alert.most_recent_instance?.message?.text || 'No description available'
+      }));
+
+      // Filter alerts by severity level
+      const filteredAlerts = mappedAlerts.filter(alert => 
+        alert.severity.toLowerCase() === severityLevel.toLowerCase()
+      );
+
+      if (filteredAlerts.length === 0) {
+        return c.text(
+          createAckEvent() +
+          createTextEvent(`No ${severityLevel} severity vulnerabilities found.`) +
+          createDoneEvent()
+        );
+      }
+
+      let response = `# ${severityLevel.charAt(0).toUpperCase() + severityLevel.slice(1)} Severity Vulnerabilities\n\n`;
+      response += `| Severity | Title | Location | Fix Command |\n`;
+      response += `|:--------:|:------:|:--------:|:----------|\n`;
+
+      filteredAlerts.forEach(alert => {
+        const location = alert.most_recent_instance?.location;
+        const locationStr = location ? `${location.path}:${location.start_line}` : 'N/A';
+        const uniqueId = `${alert.title} in ${locationStr}`;
+        
+        response += `| **${alert.severity[0].toUpperCase()}** | ${alert.title} | ${locationStr} | \`fix the vulnerability "${uniqueId}"\` |\n`;
+      });
+
+      return c.text(
+        createAckEvent() +
+        createTextEvent(response) +
+        createDoneEvent()
+      );
+
+    } catch (error) {
+      return c.text(
+        createErrorsEvent([
+          {
+            type: "agent",
+            message: "Error fetching CodeQL alerts: " + (error instanceof Error ? error.message : String(error)),
+            code: "GITHUB_API_ERROR",
+            identifier: "github_api_error",
+          },
+        ])
+      );
+    }
   }
 
   // If not asking for vulnerability analysis or Dependabot alerts, return the original response
