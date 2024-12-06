@@ -10,6 +10,8 @@ import {
   verifyAndParseRequest,
   prompt
 } from "@copilot-extensions/preview-sdk";
+import * as path from "path";
+import * as fs from "fs";
 
 const mockProjectData = {
   data: [
@@ -354,10 +356,9 @@ app.post("/", async (c) => {
 
   // Check if the prompt is asking for Dependabot alerts
   if (userPrompt.toLowerCase().includes("dependabot alerts")) {
-    const repoUrl = userPrompt.match(/https:\/\/github\.com\/([^\/]+)\/([^\/]+)/);
+    const { owner, repo } = await getRepoInfoFromGitConfig();
     
-    if (repoUrl) {
-      const [, owner, repo] = repoUrl;
+    if (repo) {
       try {
         const { data: alerts } = await octokit.request('GET /repos/{owner}/{repo}/dependabot/alerts', {
           owner,
@@ -433,6 +434,22 @@ app.post("/", async (c) => {
     response += `\n> 💡 Type "fix vuln" to get detailed remediation steps.\n`;
     
     return response;
+  }
+
+  async function getRepoInfoFromGitConfig() {
+    const gitConfigPath = path.join(process.cwd(), '.git', 'config');
+    const gitConfigContent = fs.readFileSync(gitConfigPath, 'utf8');
+    const repoUrlMatch = gitConfigContent.match(/url = (.+)/);
+  
+    if (repoUrlMatch) {
+      const repoUrl = repoUrlMatch[1];
+      const repoMatch = repoUrl.match(/github\.com[:\/]([^\/]+)\/([^\/]+)\.git/);
+      if (repoMatch) {
+        const [, owner, repo] = repoMatch;
+        return { owner, repo };
+      }
+    }
+    throw new Error('Could not determine repository information from .git/config');
   }
 
   // Add new function to get remediation steps
