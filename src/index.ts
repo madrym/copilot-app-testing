@@ -8,11 +8,13 @@ import {
   createTextEvent,
   getUserMessage,
   verifyAndParseRequest,
-  prompt
+  prompt,
+  createConfirmationEvent
 } from "@copilot-extensions/preview-sdk";
 import * as path from "path";
 import * as fs from "fs";
 import { stream } from "hono/streaming";
+import Fuse from 'fuse.js';
 
 const mockProjectData = {
   data: [
@@ -290,6 +292,62 @@ interface CodeQLAlert {
   fixed_at?: string | null;
 }
 
+// Add new interface for command intents
+interface CommandIntent {
+  name: string;
+  handler: Function;
+  patterns: string[];
+  description: string;
+}
+
+// Add new constant for command intents
+const COMMAND_INTENTS: CommandIntent[] = [
+  {
+    name: 'listVulnerabilities',
+    handler: handleCodeQLList,
+    description: 'Shows a list of security vulnerabilities in your codebase',
+    patterns: [
+      'list codeql',
+      'show vulnerabilities',
+      'show my vulnerabilities',
+      'show security issues',
+      'list security problems',
+      'display vulnerabilities',
+      'what vulnerabilities',
+      'security scan results',
+      'show me my vulnerabilities',
+      'security issues',
+      'code scanning alerts',
+      'security alerts',
+      'show security status',
+      'vulnerability report',
+      'security overview',
+      'vulnerabilities',
+      'security scan',
+      'security check'
+    ]
+  },
+  {
+    name: 'fixVulnerability',
+    handler: handleVulnerabilityFix,
+    description: 'Provides guidance on fixing a specific vulnerability',
+    patterns: [
+      'fix the vulnerability',
+      'fix vulnerability',
+      'repair vulnerability',
+      'resolve security issue',
+      'fix security problem',
+      'how to fix',
+      'solve vulnerability',
+      'patch security issue',
+      'remediate vulnerability',
+      'security fix',
+      'vulnerability solution',
+      'fix the vulnerability "'
+    ]
+  }
+];
+
 // Get the owner and repo from the .git/config file
 async function getRepoInfoFromGitConfig() {
   const gitConfigPath = path.join(process.cwd(), '.git', 'config');
@@ -371,12 +429,12 @@ async function generateCodeQLFix(alert: CodeQLAlert, token: string) {
       const filePath = path.join(process.cwd(), location.path);
       const fileContent = fs.readFileSync(filePath, 'utf8');
       
-      // Get a few lines before and after the vulnerability
+      // Get the entire file content
       const lines = fileContent.split('\n');
-      const startLine = Math.max(0, (location.start_line || 1) - 5);
-      const endLine = Math.min(lines.length, (location.end_line || location.start_line || 1) + 5);
+      const startLine = location.start_line || 1; // Start from the first line
+      const endLine = location.end_line || lines.length; // Go to the last line
       
-      codeContext = lines.slice(startLine, endLine).join('\n');
+      codeContext = lines.slice(startLine - 1, endLine).join('\n');
     } catch (error) {
       console.error("Error reading file:", error);
       codeContext = location.snippet || 'File content not available';
@@ -400,10 +458,12 @@ ${codeContext}
 Please provide:
 1. A clear explanation of why this code is vulnerable
 2. A specific code fix with before/after comparison
-3. Additional security best practices to prevent similar issues
-4. Any testing recommendations to verify the fix
+3. Additional security best practices to prevent similar issues (Limit to 2-3 bullet points)
+4. Any testing recommendations to verify the fix (Limit to 2-3 bullet points)
 
-Focus on the specific lines of code shown and provide concrete, actionable fixes.`;
+Focus on the specific lines of code shown and provide concrete, actionable fixes.
+Make your response concise and to the point.
+`;
 
   try {
     const { message } = await prompt(fixPrompt, {
@@ -415,6 +475,82 @@ Focus on the specific lines of code shown and provide concrete, actionable fixes
     console.error("Error generating fix:", error);
     return "An error occurred while generating the fix suggestion.";
   }
+}
+
+const searchablePatterns = COMMAND_INTENTS.flatMap(intent =>
+  intent.patterns.map(pattern => ({
+    pattern,
+    intent: intent.name,
+    handler: intent.handler,
+    description: intent.description
+  }))
+);
+
+const fuseOptions = {
+  keys: ['pattern'],
+  threshold: 0.6,
+  includeScore: true,
+  minMatchCharLength: 3,
+  shouldSort: true,
+  distance: 200,
+  useExtendedSearch: true,
+  ignoreLocation: true,
+  findAllMatches: true,
+  location: 0,
+  isCaseSensitive: false
+};
+
+const fuse = new Fuse(searchablePatterns, fuseOptions);
+
+function findMatchingIntent(userInput: string): { 
+  handler: Function;
+  matchedPattern: string;
+  score: number;
+  description: string;
+  userInput: string;
+} | null {
+  const normalizedInput = userInput.toLowerCase().trim();
+  
+  // Special case for fix commands
+  if (normalizedInput.startsWith('fix the vulnerability "')) {
+    return {
+      handler: handleVulnerabilityFix,
+      matchedPattern: 'fix the vulnerability',
+      score: 0,
+      description: 'Provides guidance on fixing a specific vulnerability',
+      userInput: userInput
+    };
+  }
+
+  // Regular fuzzy matching for other commands
+  const results = fuse.search(normalizedInput);
+  
+  console.log('User input:', normalizedInput);
+  console.log('Search results:', results.slice(0, 3).map(r => ({
+    pattern: r.item.pattern,
+    score: r.score
+  })));
+
+  if (results.length > 0 && results[0].score && results[0].score < 0.6) {
+    console.log('Matched intent:', results[0].item);
+    return {
+      handler: results[0].item.handler,
+      matchedPattern: results[0].item.pattern,
+      score: results[0].score as number,
+      description: results[0].item.description,
+      userInput: userInput
+    };
+  }
+  return null;
+}
+
+function createHelpMessage(): string {
+  return `I didn't quite understand that command. Here are some things you can ask me:
+
+${COMMAND_INTENTS.map(intent => `• ${intent.description}
+  Example: "${intent.patterns[0]}"`).join('\n\n')}
+
+You can try one of these commands or rephrase your request.`;
 }
 
 const app = new Hono();
@@ -440,8 +576,31 @@ async function handleCodeQLList(stream: any, octokit: Octokit, tokenForUser: str
       : alert.most_recent_instance?.message?.text || 'No description available'
   }));
 
-  const response = formatCodeQLAlerts(mappedAlerts);
-  stream.write(createTextEvent(response));
+  // First show the summary
+  const summaryResponse = formatCodeQLAlerts(mappedAlerts);
+  stream.write(createTextEvent(summaryResponse));
+
+  // For each critical and high severity vulnerability, create a confirmation event
+  mappedAlerts
+    .filter(alert => ['critical', 'high'].includes(alert.severity))
+    .forEach((alert, index) => {
+      const location = alert.most_recent_instance?.location;
+      const locationStr = location ? `${location.path}:${location.start_line}` : 'N/A';
+      
+      stream.write(createConfirmationEvent({
+        id: `vuln-${alert.number}`,
+        title: `**(${alert.severity.toUpperCase()}) ${alert.title}**`,
+        message: `**Description**: ${alert.description}\n\n` +
+        `**Location**: \`${locationStr}\`\n\n` +
+        `Would you like to get fix suggestions for this vulnerability?`,
+        metadata: {
+          alertId: alert.number,
+          location: locationStr,
+          severity: alert.severity,
+          title: alert.title
+        }
+      }));
+    });
 }
 
 async function handleVulnerabilityFix(stream: any, userPrompt: string, octokit: Octokit, tokenForUser: string) {
@@ -487,10 +646,33 @@ async function handleDefaultPrompt(stream: any, userPrompt: string, user: any, t
     model: "gpt-4",
     token: tokenForUser,
   });
-  stream.write(createTextEvent(`Hi ${user.data.login}!`));
+  stream.write(createTextEvent(`Hi ${user.data.login}!\n\n`));
   
   stream.write(createTextEvent(message.content));
   stream.write(createDoneEvent());
+}
+
+async function handleUserCommand(stream: any, userPrompt: string, octokit: Octokit, tokenForUser: string, user: any) {
+  const matchedIntent = findMatchingIntent(userPrompt);
+  
+  if (matchedIntent) {
+    console.log(`Matched intent: ${matchedIntent.matchedPattern} (score: ${matchedIntent.score})`);
+
+    if (matchedIntent.score > 0.3) {
+      stream.write(createTextEvent(
+        `I'll interpret that as "${matchedIntent.matchedPattern}". ` +
+        `If this isn't what you meant, please try rephrasing your request.\n\n`
+      ));
+    }
+
+    if (matchedIntent.handler === handleVulnerabilityFix) {
+      await matchedIntent.handler(stream, matchedIntent.userInput, octokit, tokenForUser);
+    } else {
+      await matchedIntent.handler(stream, octokit, tokenForUser);
+    }
+  } else {
+    await handleDefaultPrompt(stream, userPrompt, user, tokenForUser);
+  }
 }
 
 // Update the main app.post handler to use a switch statement
@@ -542,21 +724,8 @@ app.post("/", async (c) => {
       const octokit = new Octokit({ auth: tokenForUser });
       const user = await octokit.request("GET /user");
       const userPrompt = getUserMessage(payload);
-      const promptLower = userPrompt.toLowerCase();
 
-      switch (true) {
-        case promptLower.includes("list codeql"):
-          await handleCodeQLList(stream, octokit, tokenForUser);
-          break;
-
-        case promptLower.includes("fix the vulnerability"):
-          await handleVulnerabilityFix(stream, userPrompt, octokit, tokenForUser);
-          break;
-
-        default:
-          await handleDefaultPrompt(stream, userPrompt, user, tokenForUser);
-          break;
-      }
+      await handleUserCommand(stream, userPrompt, octokit, tokenForUser, user);
 
       stream.write(createDoneEvent());
     } catch (error) {
