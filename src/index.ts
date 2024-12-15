@@ -12,6 +12,7 @@ import {
 } from "@copilot-extensions/preview-sdk";
 import * as path from "path";
 import * as fs from "fs";
+import { stream } from "hono/streaming";
 
 const mockProjectData = {
   data: [
@@ -289,6 +290,23 @@ interface CodeQLAlert {
   fixed_at?: string | null;
 }
 
+// Get the owner and repo from the .git/config file
+async function getRepoInfoFromGitConfig() {
+  const gitConfigPath = path.join(process.cwd(), '.git', 'config');
+  const gitConfigContent = fs.readFileSync(gitConfigPath, 'utf8');
+  const repoUrlMatch = gitConfigContent.match(/url = (.+)/);
+
+  if (repoUrlMatch) {
+    const repoUrl = repoUrlMatch[1];
+    const repoMatch = repoUrl.match(/github\.com[:\/]([^\/]+)\/([^\/]+)\.git/);
+    if (repoMatch) {
+      const [, owner, repo] = repoMatch;
+      return { owner, repo };
+    }
+  }
+  throw new Error('Could not determine repository information from .git/config');
+}
+
 // Add new function to format CodeQL alerts
 function formatCodeQLAlerts(alerts: CodeQLAlert[]) {
   const severityOrder = ['critical', 'high', 'medium', 'low'];
@@ -405,6 +423,77 @@ app.get("/", (c) => {
   return c.text("Welcome to the Copilot Extension template! 👋");
 });
 
+async function handleCodeQLList(stream: any, octokit: Octokit, tokenForUser: string) {
+  const { owner, repo } = await getRepoInfoFromGitConfig();
+  const { data: alerts } = await octokit.request('GET /repos/{owner}/{repo}/code-scanning/alerts', {
+    owner,
+    repo,
+    headers: { 'X-GitHub-Api-Version': '2022-11-28' }
+  });
+
+  const mappedAlerts = alerts.map(alert => ({
+    ...alert,
+    title: alert.rule?.description || 'Unknown',
+    severity: alert.rule?.security_severity_level || 'low',
+    description: typeof alert.most_recent_instance?.message === 'string' 
+      ? alert.most_recent_instance.message 
+      : alert.most_recent_instance?.message?.text || 'No description available'
+  }));
+
+  const response = formatCodeQLAlerts(mappedAlerts);
+  stream.write(createTextEvent(response));
+}
+
+async function handleVulnerabilityFix(stream: any, userPrompt: string, octokit: Octokit, tokenForUser: string) {
+  const { owner, repo } = await getRepoInfoFromGitConfig();
+  const { data: alerts } = await octokit.request('GET /repos/{owner}/{repo}/code-scanning/alerts', {
+    owner,
+    repo,
+    headers: { 'X-GitHub-Api-Version': '2022-11-28' }
+  });
+
+  const mappedAlerts = alerts.map(alert => ({
+    ...alert,
+    title: alert.rule?.description || 'Unknown',
+    severity: alert.rule?.security_severity_level || 'low',
+    description: typeof alert.most_recent_instance?.message === 'string' 
+      ? alert.most_recent_instance.message 
+      : alert.most_recent_instance?.message?.text || 'No description available'
+  }));
+
+  const vulnIdentifier = userPrompt.match(/"([^"]+)"/)?.[1] || "";
+  const targetAlert = mappedAlerts.find(alert => {
+    const location = alert.most_recent_instance?.location;
+    if (!location) return false;
+    const locationStr = `${location.path}:${location.start_line}`;
+    return vulnIdentifier.includes(locationStr);
+  });
+
+  if (targetAlert) {
+    const fixSuggestion = await generateCodeQLFix(targetAlert, tokenForUser);
+    stream.write(createTextEvent(fixSuggestion));
+  } else {
+    stream.write(createErrorsEvent([{
+      type: "agent",
+      message: "No matching vulnerability found.",
+      code: "VULN_NOT_FOUND",
+      identifier: "vuln_not_found",
+    }]));
+  }
+}
+
+async function handleDefaultPrompt(stream: any, userPrompt: string, user: any, tokenForUser: string) {
+  const { message } = await prompt(userPrompt, {
+    model: "gpt-4",
+    token: tokenForUser,
+  });
+  stream.write(createTextEvent(`Hi ${user.data.login}!`));
+  
+  stream.write(createTextEvent(message.content));
+  stream.write(createDoneEvent());
+}
+
+// Update the main app.post handler to use a switch statement
 app.post("/", async (c) => {
   // Identify the user, using the GitHub API token provided in the request headers.
   const tokenForUser = c.req.header("X-GitHub-Token") ?? "";
@@ -443,383 +532,42 @@ app.post("/", async (c) => {
     );
   }
 
-  const octokit = new Octokit({ auth: tokenForUser });
-  const user = await octokit.request("GET /user");
-  const userPrompt = getUserMessage(payload);
+  c.header("Content-Type", "text/html");
+  c.header("X-Content-Type-Options", "nosniff");
 
-  async function analyzeCodeForVulnerabilities(code: string, token: string) {
-    const userPrompt = `Please analyze the following code for potential vulnerabilities:\n\n${code}`;
-
+  return stream(c, async (stream) => {
     try {
-      const { message } = await prompt(userPrompt, {
-        model: "gpt-4",
-        token,
-      });
+      stream.write(createAckEvent());
 
-      return message.content;
-    } catch (error) {
-      console.error("Error analyzing code:", error);
-      return "An error occurred while analyzing the code.";
-    }
-  }
+      const octokit = new Octokit({ auth: tokenForUser });
+      const user = await octokit.request("GET /user");
+      const userPrompt = getUserMessage(payload);
+      const promptLower = userPrompt.toLowerCase();
 
-  // Check if the prompt is asking for vulnerability analysis
-  if (userPrompt.toLowerCase().includes("vulnerabilities")) {
-    const codeToAnalyze = userPrompt.replace(/vulnerabilities/gi, "").trim();
-    
-    if (codeToAnalyze) {
-      const analysis = await analyzeCodeForVulnerabilities(codeToAnalyze, tokenForUser);
-      
-      return c.text(
-        createAckEvent() +
-        createTextEvent(analysis) +
-        createDoneEvent()
-      );
-    } else {
-      return c.text(
-        createErrorsEvent([
-          {
-            type: "agent",
-            message: "No code provided for vulnerability analysis.",
-            code: "NO_CODE_PROVIDED",
-            identifier: "no_code_provided",
-          },
-        ])
-      );
-    }
-  }
+      switch (true) {
+        case promptLower.includes("list codeql"):
+          await handleCodeQLList(stream, octokit, tokenForUser);
+          break;
 
-  // Check if the prompt is asking for Dependabot alerts
-  if (userPrompt.toLowerCase().includes("dependabot alerts")) {
-    const { owner, repo } = await getRepoInfoFromGitConfig();
-    
-    if (repo) {
-      try {
-        const { data: alerts } = await octokit.request('GET /repos/{owner}/{repo}/dependabot/alerts', {
-          owner,
-          repo,
-          headers: {
-            'X-GitHub-Api-Version': '2022-11-28'
-          }
-        });
+        case promptLower.includes("fix the vulnerability"):
+          await handleVulnerabilityFix(stream, userPrompt, octokit, tokenForUser);
+          break;
 
-        let response = `Dependabot alerts for ${owner}/${repo}:\n\n`;
-        if (alerts.length === 0) {
-          response += "No Dependabot alerts found.";
-        } else {
-          alerts.forEach((alert: any, index: number) => {
-            response += `${index + 1}. ${alert.security_advisory.summary}\n`;
-            response += `   Severity: ${alert.security_advisory.severity}\n`;
-            response += `   Package: ${alert.security_vulnerability.package.name}\n`;
-            response += `   Vulnerable versions: ${alert.security_vulnerability.vulnerable_version_range}\n\n`;
-          });
-        }
-
-        return c.text(
-          createAckEvent() +
-          createTextEvent(response) +
-          createDoneEvent()
-        );
-      } catch (error) {
-        return c.text(
-          createErrorsEvent([
-            {
-              type: "agent",
-              message: "Error fetching Dependabot alerts: " + (error instanceof Error ? error.message : String(error)),
-              code: "GITHUB_API_ERROR",
-              identifier: "github_api_error",
-            },
-          ])
-        );
-      }
-    } else {
-      return c.text(
-        createErrorsEvent([
-          {
-            type: "agent",
-            message: "Invalid GitHub repository URL provided.",
-            code: "INVALID_REPO_URL",
-            identifier: "invalid_repo_url",
-          },
-        ])
-      );
-    }
-  }
-
-  // Add new function to format Snyk issues
-  function formatSnykIssues(projectData: any, issuesData: any) {
-    const issues = [issuesData.data, ...issuesData.included];
-    let response = `# Security Vulnerabilities Report\n\n`;
-    response += `**Project:** ${projectData.data[0].attributes.name}\n\n`;
-    response += `Found ${issues.length} vulnerabilities:\n\n`;
-    
-    // Create table header
-    response += `| # | Vulnerability | Severity | Package | Status | Description |\n`;
-    response += `|---|--------------|-----------|---------|---------|-------------|\n`;
-    
-    // Add each issue as a table row
-    issues.forEach((issue: any, index: number) => {
-      const attr = issue.attributes;
-      const description = attr.description.substring(0, 100) + '...'; // Truncate long descriptions
-      
-      response += `| ${index + 1} | ${attr.title} | \`${attr.effective_severity_level}\` | \`${attr.coordinates[0].representations[0].resourcePath}\` | ${attr.status} | ${description} |\n`;
-    });
-    
-    // Add remediation note
-    response += `\n> 💡 Type "fix vuln" to get detailed remediation steps.\n`;
-    
-    return response;
-  }
-
-  async function getRepoInfoFromGitConfig() {
-    const gitConfigPath = path.join(process.cwd(), '.git', 'config');
-    const gitConfigContent = fs.readFileSync(gitConfigPath, 'utf8');
-    const repoUrlMatch = gitConfigContent.match(/url = (.+)/);
-  
-    if (repoUrlMatch) {
-      const repoUrl = repoUrlMatch[1];
-      const repoMatch = repoUrl.match(/github\.com[:\/]([^\/]+)\/([^\/]+)\.git/);
-      if (repoMatch) {
-        const [, owner, repo] = repoMatch;
-        return { owner, repo };
-      }
-    }
-    throw new Error('Could not determine repository information from .git/config');
-  }
-
-  // Add new function to get remediation steps
-  async function getRemediationSteps(issues: any, token: string) {
-    const remediationPrompt = `Please provide step-by-step remediation instructions for the following vulnerabilities...`;
-
-    try {
-      const { message } = await prompt(remediationPrompt, {
-        model: "gpt-4",
-        token,
-      });
-      return message.content;
-    } catch (error) {
-      console.error("Error getting remediation steps:", error);
-      return "An error occurred while generating remediation steps.";
-    }
-  }
-
-  // Check if the prompt is asking for Snyk vulnerabilities
-  if (userPrompt.toLowerCase().includes("snyk")) {
-    // Simulate API call using mock data
-    const response = formatSnykIssues(mockProjectData, mockIssuesData);
-    
-    return c.text(
-      createAckEvent() +
-      createTextEvent(response) +
-      createDoneEvent()
-    );
-  }
-
-  // Check if the prompt is asking for vulnerability fixes
-  if (userPrompt.toLowerCase().includes("fix vuln")) {
-    const remediationSteps = await getRemediationSteps(mockIssuesData, tokenForUser);
-    
-    return c.text(
-      createAckEvent() +
-      createTextEvent(remediationSteps) +
-      createDoneEvent()
-    );
-  }
-
-  // Check if the prompt is asking for CodeQL alerts
-  if (userPrompt.toLowerCase().includes("list codeql")) {
-    const { owner, repo } = await getRepoInfoFromGitConfig();
-    
-    try {
-      const { data: alerts } = await octokit.request('GET /repos/{owner}/{repo}/code-scanning/alerts', {
-        owner,
-        repo,
-        headers: {
-          'X-GitHub-Api-Version': '2022-11-28'
-        }
-      });
-
-      const mappedAlerts: CodeQLAlert[] = alerts.map(alert => ({
-        ...alert,
-        title: alert.rule?.description || 'Unknown',
-        severity: alert.rule?.security_severity_level || 'unknown',
-        description: typeof alert.most_recent_instance?.message === 'string' 
-          ? alert.most_recent_instance.message 
-          : alert.most_recent_instance?.message?.text || 'No description available'
-      }));
-
-      const response = formatCodeQLAlerts(mappedAlerts);
-      
-      return c.text(
-        createAckEvent() +
-        createTextEvent(response) +
-        createDoneEvent()
-      );
-    } catch (error) {
-      return c.text(
-        createErrorsEvent([
-          {
-            type: "agent",
-            message: "Error fetching CodeQL alerts: " + (error instanceof Error ? error.message : String(error)),
-            code: "GITHUB_API_ERROR",
-            identifier: "github_api_error",
-          },
-        ])
-      );
-    }
-  }
-
-  // Check if the prompt is asking for CodeQL fix suggestions
-  if (userPrompt.toLowerCase().includes("fix codeql") || userPrompt.toLowerCase().includes("fix the vulnerability")) {
-    const { owner, repo } = await getRepoInfoFromGitConfig();
-    
-    try {
-      const { data: alerts } = await octokit.request('GET /repos/{owner}/{repo}/code-scanning/alerts', {
-        owner,
-        repo,
-        headers: {
-          'X-GitHub-Api-Version': '2022-11-28'
-        }
-      });
-
-      const mappedAlerts: CodeQLAlert[] = alerts.map(alert => ({
-        ...alert,
-        title: alert.rule?.description || 'Unknown',
-        severity: alert.rule?.security_severity_level || 'unknown',
-        description: typeof alert.most_recent_instance?.message === 'string' 
-          ? alert.most_recent_instance.message 
-          : alert.most_recent_instance?.message?.text || 'No description available'
-      }));
-
-      let targetAlert: CodeQLAlert | undefined;
-      
-      if (userPrompt.toLowerCase().includes("fix the vulnerability")) {
-        const vulnIdentifier = userPrompt.match(/"([^"]+)"/)?.[1] || "";
-        targetAlert = mappedAlerts.find(alert => {
-          const location = alert.most_recent_instance?.location;
-          if (!location) return false;
-          
-          const locationStr = `${location.path}:${location.start_line}`;
-          return vulnIdentifier.includes(locationStr);
-        });
-      } else {
-        // If just "fix codeql", take the most severe open alert
-        targetAlert = mappedAlerts.find(alert => 
-          alert.state === "open" && 
-          (alert.severity === "critical" || alert.severity === "high")
-        );
+        default:
+          await handleDefaultPrompt(stream, userPrompt, user, tokenForUser);
+          break;
       }
 
-      if (!targetAlert) {
-        return c.text(
-          createErrorsEvent([
-            {
-              type: "agent",
-              message: "No matching vulnerability found.",
-              code: "VULN_NOT_FOUND",
-              identifier: "vuln_not_found",
-            },
-          ])
-        );
-      }
-
-      const fixSuggestion = await generateCodeQLFix(targetAlert, tokenForUser);
-      
-      return c.text(
-        createAckEvent() +
-        createTextEvent(fixSuggestion) +
-        createDoneEvent()
-      );
+      stream.write(createDoneEvent());
     } catch (error) {
-      return c.text(
-        createErrorsEvent([
-          {
-            type: "agent",
-            message: "Error processing CodeQL fix: " + (error instanceof Error ? error.message : String(error)),
-            code: "GITHUB_API_ERROR",
-            identifier: "github_api_error",
-          },
-        ])
-      );
+      stream.write(createErrorsEvent([{
+        type: "agent",
+        message: error instanceof Error ? error.message : "Unknown error",
+        code: "PROCESSING_ERROR",
+        identifier: "processing_error",
+      }]));
     }
-  }
-
-  // Add new condition for expand command
-  if (userPrompt.toLowerCase().startsWith("expand")) {
-    const { owner, repo } = await getRepoInfoFromGitConfig();
-    const severityLevel = userPrompt.toLowerCase().split(" ")[1];
-    
-    try {
-      const { data: alerts } = await octokit.request('GET /repos/{owner}/{repo}/code-scanning/alerts', {
-        owner,
-        repo,
-        headers: {
-          'X-GitHub-Api-Version': '2022-11-28'
-        }
-      });
-
-      const mappedAlerts: CodeQLAlert[] = alerts.map(alert => ({
-        ...alert,
-        title: alert.rule?.description || 'Unknown',
-        severity: alert.rule?.security_severity_level || 'unknown',
-        description: typeof alert.most_recent_instance?.message === 'string' 
-          ? alert.most_recent_instance.message 
-          : alert.most_recent_instance?.message?.text || 'No description available'
-      }));
-
-      // Filter alerts by severity level
-      const filteredAlerts = mappedAlerts.filter(alert => 
-        alert.severity.toLowerCase() === severityLevel.toLowerCase()
-      );
-
-      if (filteredAlerts.length === 0) {
-        return c.text(
-          createAckEvent() +
-          createTextEvent(`No ${severityLevel} severity vulnerabilities found.`) +
-          createDoneEvent()
-        );
-      }
-
-      let response = `# ${severityLevel.charAt(0).toUpperCase() + severityLevel.slice(1)} Severity Vulnerabilities\n\n`;
-      response += `| Severity | Title | Location | Fix Command |\n`;
-      response += `|:--------:|:------:|:--------:|:----------|\n`;
-
-      filteredAlerts.forEach(alert => {
-        const location = alert.most_recent_instance?.location;
-        const locationStr = location ? `${location.path}:${location.start_line}` : 'N/A';
-        const uniqueId = `${alert.title} in ${locationStr}`;
-        
-        response += `| **${alert.severity[0].toUpperCase()}** | ${alert.title} | ${locationStr} | \`fix the vulnerability "${uniqueId}"\` |\n`;
-      });
-
-      return c.text(
-        createAckEvent() +
-        createTextEvent(response) +
-        createDoneEvent()
-      );
-
-    } catch (error) {
-      return c.text(
-        createErrorsEvent([
-          {
-            type: "agent",
-            message: "Error fetching CodeQL alerts: " + (error instanceof Error ? error.message : String(error)),
-            code: "GITHUB_API_ERROR",
-            identifier: "github_api_error",
-          },
-        ])
-      );
-    }
-  }
-
-  // If not asking for vulnerability analysis or Dependabot alerts, return the original response
-  return c.text(
-    createAckEvent() +
-      createTextEvent(
-        `Welcome ${user.data.login}! It looks like you asked the following question, "${userPrompt}". This is a GitHub Copilot extension template, so it's up to you to decide what you want to implement to answer prompts.`
-      ) +
-      createDoneEvent()
-  );
+  });
 });
 
 const port = 3000;
